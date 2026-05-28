@@ -72,8 +72,8 @@ src/main/java/com/interstellar/shorturl/
 ```
 POST /api/shorten
   → SecureRandom + Base62로 6자리 코드 생성
-  → DB 충돌 확인 (최대 3회 재시도)
-  → PostgreSQL 저장
+  → PostgreSQL 저장 (saveAndFlush)
+    └─ shortCode 유니크 제약 위반 시 재시도 (최대 3회)
   → Redis에 선제 캐싱 (TTL 24h)
   → 단축 URL 반환
 ```
@@ -93,6 +93,31 @@ GET /{code}
 
 - 경우의 수: 62⁶ = **56,800,235,584** (약 568억)
 - 충돌 발생 시 최대 3회 재시도
+
+## 동시성 처리
+
+### 단축 코드 충돌 (TOCTOU Race Condition)
+
+DB 조회 후 저장하는 Check-Then-Act 방식은 동시 요청 환경에서 두 스레드가 동시에 같은 코드를 사용 가능하다고 판단한 뒤 저장을 시도하는 race condition이 발생합니다.
+
+**해결 방법**: `existsByShortCode` 사전 체크를 제거하고, `saveAndFlush`로 즉시 DB에 반영한 뒤 유니크 제약 위반(`DataIntegrityViolationException`)을 catch하여 재시도합니다. DB 유니크 제약이 실질적인 충돌 방어선이 됩니다.
+
+```java
+for (int i = 0; i < MAX_RETRY; i++) {
+    try {
+        String shortCode = codeGenerator.generate();
+        urlRepository.saveAndFlush(Url.create(originalUrl, shortCode));
+        urlCacheRepository.save(shortCode, originalUrl);
+        return shortCode;
+    } catch (DataIntegrityViolationException e) {
+        // shortCode 충돌 시 재시도
+    }
+}
+```
+
+### Redis-DB 정합성
+
+`saveAndFlush`로 DB 커밋을 먼저 확정한 뒤 Redis에 씁니다. Redis 쓰기 실패 시에도 조회 시 DB에서 가져와 재캐싱하므로 데이터 손실은 없습니다.
 
 ## 실행 방법
 
